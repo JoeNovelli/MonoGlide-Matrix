@@ -1,0 +1,1035 @@
+// ============================================================================
+// MONOGLIDE MATRIX v0.2.6 — TONIC ROLE HANDOFF
+// ============================================================================
+//
+// HOTFIXES
+//   - True two-role handoff between bass anchor and lead
+//   - Preserve notes that remain active even when their role changes
+//   - Route genuine lead replacements through Classic/Overlap/Bloom timing
+//   - Avoid unwanted cuts, retriggers, and orphaned queued notes
+//
+// NEW
+//   - TONIC priority: protected lowest-held bass anchor
+//   - Higher notes use LAST priority as an independent lead voice
+//   - Cleaner, shorter knob and pad labels
+//
+// TRANSITIONS
+//   - CLASSIC
+//   - OVERLAP (0–500 ms musical taper)
+//   - BLOOM (0–2000 ms extended taper)
+//
+// TONIC TEST BEHAVIOR
+//   Hold a low note. Higher notes may glide/bloom above it.
+//   The low anchor remains sounding until physically released.
+//   A newly played lower note becomes the new anchor.
+//
+// This is a focused test build: one output channel, all input channels.
+// ============================================================================
+
+@OnLoad
+
+  ShowLayout 2
+  SetShortName {MGM026}
+  LabelKnobs {MONOGLIDE MATRIX v0.2.6}
+  LabelPads {TONIC ANCHOR TEST}
+
+  FillArray heldCount, 0, 128
+  FillArray lastVelocity, 0, 128
+  FillArray firstOrder, 0, 128
+  FillArray lastOrder, 0, 128
+  FillArray noteGeneration, 0, 128
+  ResetNoteStates
+
+  queueSize = 32
+  FillArray queueActive, 0, queueSize
+  FillArray queueNote, 0, queueSize
+  FillArray queueChannel, 0, queueSize
+  FillArray queueGeneration, 0, queueSize
+  FillArray queueDueTick, 0, queueSize
+  queueCount = 0
+  timerTick = 0
+
+  currentValid = NO
+  currentNote = 0
+  currentVelocity = 0
+  desiredValid = NO
+  desiredNote = 0
+  desiredVelocity = 0
+
+  anchorValid = NO
+  anchorNote = 0
+  anchorVelocity = 0
+  desiredAnchorValid = NO
+  desiredAnchorNote = 0
+  desiredAnchorVelocity = 0
+
+  leadValid = NO
+  leadNote = 0
+  leadVelocity = 0
+  desiredLeadValid = NO
+  desiredLeadNote = 0
+  desiredLeadVelocity = 0
+
+  heldPitchCount = 0
+  pressCounter = 1
+
+  // 0 LAST, 1 FIRST, 2 HIGH, 3 LOW, 4 TONIC
+  priorityMode = 0
+
+  // 0 CLASSIC, 1 OVERLAP, 2 BLOOM
+  transitionMode = 0
+
+  overlapRaw = 21
+  overlapMs = 0
+
+  // Displayed output channel 2.
+  outputChannel = 1
+
+  SetKnobValue 0, 0
+  SetKnobValue 1, 0
+  SetKnobValue 2, overlapRaw
+  SetKnobValue 3, 8
+
+  LabelPad 0, {PANIC}
+  LabelPad 1, {NOW --}
+  LabelPad 2, {HELD 0}
+  LabelPad 3, {LAST}
+  LabelPad 4, {CLASSIC}
+  LabelPad 5, {N/A}
+  LabelPad 6, {OUT 2}
+  LabelPad 7, {Q 0}
+  LabelPad 8, {LEAD --}
+  LabelPad 9, {BASS --}
+  LabelPad 10, {TONIC}
+  LabelPad 11, {TEST}
+  LabelPad 12, {v0.2.6}
+  LabelPad 13, {ANCHOR}
+  LabelPad 14, {BLOOM}
+  LabelPad 15, {RAVIOLI}
+
+  Call @CalculateDuration
+  Call @UpdateLabels
+  Call @UpdateStatus
+
+  SetTimerInterval 1
+  StartTimer
+
+  Log {MonoGlide Matrix v0.2.6 loaded}
+  Log {TONIC protected bass anchor test}
+@End
+
+
+// ============================================================================
+// MIDI INPUT
+// ============================================================================
+
+@OnMidiNoteOn
+
+  eventChannel = MIDIChannel
+  eventNote = MIDINote
+  eventVelocity = MIDIVelocity
+
+  sourceWasHeld = GetNoteState eventChannel, eventNote
+
+  if sourceWasHeld = 0
+    SetNoteState eventChannel, eventNote, 1
+    heldCount[eventNote] = heldCount[eventNote] + 1
+
+    if heldCount[eventNote] = 1
+      heldPitchCount = heldPitchCount + 1
+      firstOrder[eventNote] = pressCounter
+    endif
+  endif
+
+  lastOrder[eventNote] = pressCounter
+  lastVelocity[eventNote] = eventVelocity
+  pressCounter = pressCounter + 1
+
+  Call @ResolveMusicalState
+  Call @ReconcileMusicalState
+  Call @UpdateStatus
+
+@End
+
+
+@OnMidiNoteOff
+
+  eventChannel = MIDIChannel
+  eventNote = MIDINote
+
+  sourceWasHeld = GetNoteState eventChannel, eventNote
+
+  if sourceWasHeld <> 0
+    SetNoteState eventChannel, eventNote, 0
+    heldCount[eventNote] = heldCount[eventNote] - 1
+
+    if heldCount[eventNote] < 0
+      heldCount[eventNote] = 0
+    endif
+
+    if heldCount[eventNote] = 0
+      heldPitchCount = heldPitchCount - 1
+
+      if heldPitchCount < 0
+        heldPitchCount = 0
+      endif
+    endif
+
+    Call @ResolveMusicalState
+    Call @ReconcileMusicalState
+    Call @UpdateStatus
+  endif
+
+@End
+
+
+// ============================================================================
+// TIMER / DELAYED RELEASE QUEUE
+// ============================================================================
+
+@OnTimer
+
+  timerTick = timerTick + 1
+
+  if queueCount > 0
+    for queueIndex = 0 to (queueSize - 1)
+
+      if queueActive[queueIndex]
+        if timerTick >= queueDueTick[queueIndex]
+
+          queuedNote = queueNote[queueIndex]
+          queuedChannel = queueChannel[queueIndex]
+          queuedGeneration = queueGeneration[queueIndex]
+
+          queueActive[queueIndex] = NO
+          queueCount = queueCount - 1
+          queueStillValid = NO
+
+          if noteGeneration[queuedNote] = queuedGeneration
+            queueStillValid = YES
+          endif
+
+          // Protect every note currently owned by either engine.
+          if currentValid
+            if currentNote = queuedNote
+              queueStillValid = NO
+            endif
+          endif
+
+          if anchorValid
+            if anchorNote = queuedNote
+              queueStillValid = NO
+            endif
+          endif
+
+          if leadValid
+            if leadNote = queuedNote
+              queueStillValid = NO
+            endif
+          endif
+
+          if queueStillValid
+            SendMIDINoteOff queuedChannel, queuedNote, 0
+          endif
+
+        endif
+      endif
+
+    endfor
+
+    if queueCount < 0
+      queueCount = 0
+    endif
+
+    Call @UpdateQueuePad
+  endif
+
+@End
+
+
+// ============================================================================
+// CONTROLS
+// ============================================================================
+
+@OnKnobChange
+
+  changedKnob = LastKnob
+  changedValue = GetKnobValue changedKnob
+
+  if changedKnob = 0
+
+    // Five equal-ish regions across 0–127.
+    newPriorityMode = RoundDown (changedValue / 26)
+
+    if newPriorityMode > 4
+      newPriorityMode = 4
+    endif
+
+    if newPriorityMode <> priorityMode
+      Call @SilenceOwnedVoices
+      priorityMode = newPriorityMode
+      Call @ResolveMusicalState
+      Call @ReconcileMusicalState
+    endif
+
+  elseif changedKnob = 1
+
+    if changedValue < 43
+      transitionMode = 0
+    elseif changedValue < 86
+      transitionMode = 1
+    else
+      transitionMode = 2
+    endif
+
+    Call @CalculateDuration
+
+  elseif changedKnob = 2
+
+    overlapRaw = changedValue
+    Call @CalculateDuration
+
+  elseif changedKnob = 3
+
+    newOutputChannel = Round (changedValue * 15 / 127)
+
+    if newOutputChannel <> outputChannel
+      Call @SilenceOwnedVoices
+      SendMIDICC outputChannel, 123, 0
+      outputChannel = newOutputChannel
+      Call @ResolveMusicalState
+      Call @ReconcileMusicalState
+    endif
+
+  endif
+
+  Call @UpdateLabels
+  Call @UpdateStatus
+
+@End
+
+
+@OnPadDown
+
+  if LastPad = 0
+    Call @PanicSelected
+  endif
+
+@End
+
+
+// ============================================================================
+// RESOLVER DISPATCH
+// ============================================================================
+
+@ResolveMusicalState
+
+  if priorityMode = 4
+    Call @ResolveTonic
+  else
+    Call @ResolvePriority
+  endif
+
+@End
+
+
+@ReconcileMusicalState
+
+  if priorityMode = 4
+    Call @ReconcileTonic
+  else
+    Call @ReconcileCurrentNote
+  endif
+
+@End
+
+
+// ============================================================================
+// STANDARD PRIORITY RESOLVER
+// ============================================================================
+
+@ResolvePriority
+
+  desiredValid = NO
+  desiredNote = 0
+  desiredVelocity = 0
+
+  if heldPitchCount > 0
+
+    if priorityMode = 0
+
+      bestOrder = -1
+
+      for scanNote = 0 to 127
+        if heldCount[scanNote] > 0
+          if lastOrder[scanNote] > bestOrder
+            bestOrder = lastOrder[scanNote]
+            desiredNote = scanNote
+            desiredValid = YES
+          endif
+        endif
+      endfor
+
+    elseif priorityMode = 1
+
+      bestOrder = 10000000
+
+      for scanNote = 0 to 127
+        if heldCount[scanNote] > 0
+          if firstOrder[scanNote] < bestOrder
+            bestOrder = firstOrder[scanNote]
+            desiredNote = scanNote
+            desiredValid = YES
+          endif
+        endif
+      endfor
+
+    elseif priorityMode = 2
+
+      for scanNote = 0 to 127
+        if heldCount[scanNote] > 0
+          desiredNote = scanNote
+          desiredValid = YES
+        endif
+      endfor
+
+    else
+
+      lowFound = NO
+
+      for scanNote = 0 to 127
+        if heldCount[scanNote] > 0
+          if lowFound = NO
+            desiredNote = scanNote
+            desiredValid = YES
+            lowFound = YES
+          endif
+        endif
+      endfor
+
+    endif
+
+    if desiredValid
+      desiredVelocity = lastVelocity[desiredNote]
+    endif
+  endif
+
+@End
+
+
+// ============================================================================
+// TONIC RESOLVER
+// Lowest held pitch is the anchor.
+// Most recently played remaining pitch is the lead.
+// ============================================================================
+
+@ResolveTonic
+
+  desiredAnchorValid = NO
+  desiredAnchorNote = 0
+  desiredAnchorVelocity = 0
+
+  desiredLeadValid = NO
+  desiredLeadNote = 0
+  desiredLeadVelocity = 0
+
+  // Find lowest held pitch.
+  anchorFound = NO
+
+  for scanNote = 0 to 127
+    if heldCount[scanNote] > 0
+      if anchorFound = NO
+        desiredAnchorNote = scanNote
+        desiredAnchorVelocity = lastVelocity[scanNote]
+        desiredAnchorValid = YES
+        anchorFound = YES
+      endif
+    endif
+  endfor
+
+  // Find LAST-priority lead, excluding the anchor.
+  if desiredAnchorValid
+
+    bestOrder = -1
+
+    for scanNote = 0 to 127
+      if heldCount[scanNote] > 0
+        if scanNote <> desiredAnchorNote
+          if lastOrder[scanNote] > bestOrder
+            bestOrder = lastOrder[scanNote]
+            desiredLeadNote = scanNote
+            desiredLeadVelocity = lastVelocity[scanNote]
+            desiredLeadValid = YES
+          endif
+        endif
+      endif
+    endfor
+
+  endif
+
+@End
+
+
+// ============================================================================
+// STANDARD MONO RECONCILIATION
+// ============================================================================
+
+@ReconcileCurrentNote
+
+  if currentValid = NO and desiredValid = YES
+
+    noteGeneration[desiredNote] = noteGeneration[desiredNote] + 1
+    SendMIDINoteOn outputChannel, desiredNote, desiredVelocity
+    currentNote = desiredNote
+    currentVelocity = desiredVelocity
+    currentValid = YES
+
+  elseif currentValid = YES and desiredValid = NO
+
+    SendMIDINoteOff outputChannel, currentNote, 0
+    currentValid = NO
+
+  elseif currentValid = YES and desiredValid = YES
+
+    if currentNote <> desiredNote
+      oldNote = currentNote
+      newNote = desiredNote
+      newVelocity = desiredVelocity
+      Call @PerformTransition
+      currentNote = newNote
+      currentVelocity = newVelocity
+      currentValid = YES
+    endif
+
+  endif
+
+@End
+
+
+// ============================================================================
+// TONIC RECONCILIATION
+// ============================================================================
+
+@ReconcileTonic
+
+  anchorChanged = NO
+
+  if anchorValid <> desiredAnchorValid
+    anchorChanged = YES
+  elseif anchorValid
+    if anchorNote <> desiredAnchorNote
+      anchorChanged = YES
+    endif
+  endif
+
+  // When the bass anchor changes, reconcile the two sounding roles as a set.
+  if anchorChanged
+
+    oldAnchorWasValid = anchorValid
+    oldAnchorNote = anchorNote
+    oldLeadWasValid = leadValid
+    oldLeadNote = leadNote
+
+    // Does each old sounding note remain wanted in either new role?
+    keepOldAnchor = NO
+    keepOldLead = NO
+
+    if oldAnchorWasValid
+      if desiredAnchorValid
+        if oldAnchorNote = desiredAnchorNote
+          keepOldAnchor = YES
+        endif
+      endif
+
+      if desiredLeadValid
+        if oldAnchorNote = desiredLeadNote
+          keepOldAnchor = YES
+        endif
+      endif
+    endif
+
+    if oldLeadWasValid
+      if desiredAnchorValid
+        if oldLeadNote = desiredAnchorNote
+          keepOldLead = YES
+        endif
+      endif
+
+      if desiredLeadValid
+        if oldLeadNote = desiredLeadNote
+          keepOldLead = YES
+        endif
+      endif
+    endif
+
+    // Clear pending releases, but do not turn off notes that remain wanted.
+    for queueIndex = 0 to (queueSize - 1)
+
+      if queueActive[queueIndex]
+
+        queuedStillWanted = NO
+
+        if desiredAnchorValid
+          if queueNote[queueIndex] = desiredAnchorNote
+            queuedStillWanted = YES
+          endif
+        endif
+
+        if desiredLeadValid
+          if queueNote[queueIndex] = desiredLeadNote
+            queuedStillWanted = YES
+          endif
+        endif
+
+        if queuedStillWanted = NO
+          SendMIDINoteOff queueChannel[queueIndex], queueNote[queueIndex], 0
+        endif
+
+        queueActive[queueIndex] = NO
+
+      endif
+
+    endfor
+
+    queueCount = 0
+    Call @UpdateQueuePad
+
+    // Track whether each desired note is already sounding from an old role.
+    desiredAnchorAlreadyOn = NO
+    desiredLeadAlreadyOn = NO
+
+    if desiredAnchorValid
+      if oldAnchorWasValid
+        if oldAnchorNote = desiredAnchorNote
+          desiredAnchorAlreadyOn = YES
+        endif
+      endif
+
+      if oldLeadWasValid
+        if oldLeadNote = desiredAnchorNote
+          desiredAnchorAlreadyOn = YES
+        endif
+      endif
+    endif
+
+    if desiredLeadValid
+      if oldAnchorWasValid
+        if oldAnchorNote = desiredLeadNote
+          desiredLeadAlreadyOn = YES
+        endif
+      endif
+
+      if oldLeadWasValid
+        if oldLeadNote = desiredLeadNote
+          desiredLeadAlreadyOn = YES
+        endif
+      endif
+    endif
+
+    // If the old lead is no longer wanted, transition it to the new lead.
+    if oldLeadWasValid
+      if keepOldLead = NO
+
+        if desiredLeadValid
+
+          if desiredLeadAlreadyOn
+
+            // The replacement lead is already sounding as the old anchor.
+            // Release the old lead using the selected timing without retriggering.
+            oldNote = oldLeadNote
+
+            if transitionMode = 0
+              SendMIDINoteOff outputChannel, oldNote, 0
+            else
+              if overlapMs > 0
+                Call @QueueOldNoteOff
+              else
+                SendMIDINoteOff outputChannel, oldNote, 0
+              endif
+            endif
+
+          else
+
+            oldNote = oldLeadNote
+            newNote = desiredLeadNote
+            newVelocity = desiredLeadVelocity
+            Call @PerformTransition
+            desiredLeadAlreadyOn = YES
+
+          endif
+
+        else
+
+          SendMIDINoteOff outputChannel, oldLeadNote, 0
+
+        endif
+
+      endif
+    endif
+
+    // Release an old anchor that is not wanted in either new role.
+    if oldAnchorWasValid
+      if keepOldAnchor = NO
+        SendMIDINoteOff outputChannel, oldAnchorNote, 0
+      endif
+    endif
+
+    // Start the desired anchor only when it is not already sounding.
+    if desiredAnchorValid
+      if desiredAnchorAlreadyOn = NO
+        noteGeneration[desiredAnchorNote] = noteGeneration[desiredAnchorNote] + 1
+        SendMIDINoteOn outputChannel, desiredAnchorNote, desiredAnchorVelocity
+      endif
+    endif
+
+    // Start the desired lead only when it was not already sounding or started.
+    if desiredLeadValid
+      if desiredLeadAlreadyOn = NO
+        noteGeneration[desiredLeadNote] = noteGeneration[desiredLeadNote] + 1
+        SendMIDINoteOn outputChannel, desiredLeadNote, desiredLeadVelocity
+      endif
+    endif
+
+    // Assign the new roles without sending any additional MIDI.
+    anchorValid = desiredAnchorValid
+
+    if desiredAnchorValid
+      anchorNote = desiredAnchorNote
+      anchorVelocity = desiredAnchorVelocity
+    endif
+
+    leadValid = desiredLeadValid
+
+    if desiredLeadValid
+      leadNote = desiredLeadNote
+      leadVelocity = desiredLeadVelocity
+    endif
+
+  // Stable anchor: reconcile only the lead voice.
+  else
+
+    if leadValid = NO and desiredLeadValid = YES
+
+      noteGeneration[desiredLeadNote] = noteGeneration[desiredLeadNote] + 1
+      SendMIDINoteOn outputChannel, desiredLeadNote, desiredLeadVelocity
+      leadNote = desiredLeadNote
+      leadVelocity = desiredLeadVelocity
+      leadValid = YES
+
+    elseif leadValid = YES and desiredLeadValid = NO
+
+      SendMIDINoteOff outputChannel, leadNote, 0
+      leadValid = NO
+
+    elseif leadValid = YES and desiredLeadValid = YES
+
+      if leadNote <> desiredLeadNote
+        oldNote = leadNote
+        newNote = desiredLeadNote
+        newVelocity = desiredLeadVelocity
+        Call @PerformTransition
+        leadNote = newNote
+        leadVelocity = newVelocity
+        leadValid = YES
+      endif
+
+    endif
+
+  endif
+
+@End
+
+
+// ============================================================================
+// SHARED TRANSITION
+// Uses globals oldNote, newNote, newVelocity.
+// ============================================================================
+
+@PerformTransition
+
+  if transitionMode = 0
+
+    SendMIDINoteOff outputChannel, oldNote, 0
+    noteGeneration[newNote] = noteGeneration[newNote] + 1
+    SendMIDINoteOn outputChannel, newNote, newVelocity
+
+  else
+
+    noteGeneration[newNote] = noteGeneration[newNote] + 1
+    SendMIDINoteOn outputChannel, newNote, newVelocity
+
+    if overlapMs > 0
+      Call @QueueOldNoteOff
+    else
+      SendMIDINoteOff outputChannel, oldNote, 0
+    endif
+
+  endif
+
+@End
+
+
+// ============================================================================
+// QUEUE
+// ============================================================================
+
+@QueueOldNoteOff
+
+  freeSlot = -1
+
+  for queueIndex = 0 to (queueSize - 1)
+    if queueActive[queueIndex] = NO
+      if freeSlot = -1
+        freeSlot = queueIndex
+      endif
+    endif
+  endfor
+
+  if freeSlot >= 0
+
+    queueActive[freeSlot] = YES
+    queueNote[freeSlot] = oldNote
+    queueChannel[freeSlot] = outputChannel
+    queueGeneration[freeSlot] = noteGeneration[oldNote]
+    queueDueTick[freeSlot] = timerTick + overlapMs
+    queueCount = queueCount + 1
+
+  else
+
+    SendMIDINoteOff outputChannel, oldNote, 0
+    Log {WARNING: queue full}
+
+  endif
+
+  Call @UpdateQueuePad
+
+@End
+
+
+@FlushQueue
+
+  // Send every pending Note Off before clearing the queue.
+  // Used when rebuilding Tonic roles so no blooming note is orphaned.
+  for queueIndex = 0 to (queueSize - 1)
+
+    if queueActive[queueIndex]
+
+      SendMIDINoteOff queueChannel[queueIndex], queueNote[queueIndex], 0
+      queueActive[queueIndex] = NO
+
+    endif
+
+  endfor
+
+  queueCount = 0
+  Call @UpdateQueuePad
+
+@End
+
+
+@ClearQueue
+
+  FillArray queueActive, 0, queueSize
+  queueCount = 0
+  Call @UpdateQueuePad
+
+@End
+
+
+// ============================================================================
+// SILENCE / PANIC / RESET
+// ============================================================================
+
+@SilenceOwnedVoices
+
+  if currentValid
+    SendMIDINoteOff outputChannel, currentNote, 0
+  endif
+
+  if anchorValid
+    SendMIDINoteOff outputChannel, anchorNote, 0
+  endif
+
+  if leadValid
+    if leadNote <> anchorNote
+      SendMIDINoteOff outputChannel, leadNote, 0
+    endif
+  endif
+
+  Call @FlushQueue
+
+  currentValid = NO
+  anchorValid = NO
+  leadValid = NO
+
+@End
+
+
+@PanicSelected
+
+  Call @SilenceOwnedVoices
+  SendMIDICC outputChannel, 123, 0
+  SendMIDICC outputChannel, 120, 0
+  Call @ResetEngine
+  FlashPad 0
+  Log {PANIC SELECTED}
+@End
+
+
+@ResetEngine
+
+  ResetNoteStates
+  FillArray heldCount, 0, 128
+  FillArray lastVelocity, 0, 128
+  FillArray firstOrder, 0, 128
+  FillArray lastOrder, 0, 128
+
+  currentValid = NO
+  desiredValid = NO
+  anchorValid = NO
+  desiredAnchorValid = NO
+  leadValid = NO
+  desiredLeadValid = NO
+
+  heldPitchCount = 0
+  pressCounter = 1
+
+  Call @UpdateStatus
+
+@End
+
+
+// ============================================================================
+// DURATION CURVES
+// ============================================================================
+
+@CalculateDuration
+
+  if transitionMode = 0
+
+    overlapMs = 0
+
+  elseif transitionMode = 1
+
+    if overlapRaw <= 63
+      overlapMs = Round (overlapRaw * 60 / 63)
+    else
+      overlapUpper = overlapRaw - 63
+      overlapMs = Round (60 + (overlapUpper * overlapUpper * 440 / 4096))
+    endif
+
+  else
+
+    if overlapRaw <= 63
+      overlapMs = Round (overlapRaw * 250 / 63)
+    else
+      overlapUpper = overlapRaw - 63
+      overlapMs = Round (250 + (overlapUpper * overlapUpper * 1750 / 4096))
+    endif
+
+  endif
+
+@End
+
+
+// ============================================================================
+// UI
+// ============================================================================
+
+@UpdateLabels
+
+  if priorityMode = 0
+    LabelKnob 0, {LAST}
+  elseif priorityMode = 1
+    LabelKnob 0, {FIRST}
+  elseif priorityMode = 2
+    LabelKnob 0, {HIGH}
+  elseif priorityMode = 3
+    LabelKnob 0, {LOW}
+  else
+    LabelKnob 0, {TONIC}
+  endif
+
+  if transitionMode = 0
+    LabelKnob 1, {CLASSIC}
+    LabelKnob 2, {N/A}
+  elseif transitionMode = 1
+    LabelKnob 1, {OVERLAP}
+    LabelKnob 2, overlapMs, {ms}
+  else
+    LabelKnob 1, {BLOOM}
+    LabelKnob 2, overlapMs, {ms}
+  endif
+
+  LabelKnob 3, {OUT }, outputChannel + 1
+
+@End
+
+
+@UpdateStatus
+
+  LabelPad 2, {HELD }, heldPitchCount
+
+  if priorityMode = 4
+
+    LabelPad 3, {TONIC}
+
+    if anchorValid
+      LabelPad 1, {BASS }, (NoteName anchorNote, YES)
+      LabelPad 9, {BASS }, (NoteName anchorNote, YES)
+    else
+      LabelPad 1, {BASS --}
+      LabelPad 9, {BASS --}
+    endif
+
+    if leadValid
+      LabelPad 8, {LEAD }, (NoteName leadNote, YES)
+    else
+      LabelPad 8, {LEAD --}
+    endif
+
+  else
+
+    if currentValid
+      LabelPad 1, {NOW }, (NoteName currentNote, YES)
+    else
+      LabelPad 1, {NOW --}
+    endif
+
+    if priorityMode = 0
+      LabelPad 3, {LAST}
+    elseif priorityMode = 1
+      LabelPad 3, {FIRST}
+    elseif priorityMode = 2
+      LabelPad 3, {HIGH}
+    else
+      LabelPad 3, {LOW}
+    endif
+
+    LabelPad 8, {LEAD --}
+    LabelPad 9, {BASS --}
+
+  endif
+
+  if transitionMode = 0
+    LabelPad 4, {CLASSIC}
+    LabelPad 5, {N/A}
+  elseif transitionMode = 1
+    LabelPad 4, {OVERLAP}
+    LabelPad 5, overlapMs, {ms}
+  else
+    LabelPad 4, {BLOOM}
+    LabelPad 5, overlapMs, {ms}
+  endif
+
+  LabelPad 6, {OUT }, outputChannel + 1
+  Call @UpdateQueuePad
+
+@End
+
+
+@UpdateQueuePad
+
+  LabelPad 7, {Q }, queueCount
+
+@End

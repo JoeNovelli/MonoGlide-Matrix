@@ -1,0 +1,401 @@
+// ============================================================================
+// MONOGLIDE MATRIX v0.1.1 — STABLE CORE ENGINE
+// ============================================================================
+// Polyphonic-to-monophonic MIDI processor for Mozaic.
+// Tested in Mozaic and Loopy Pro: 8/8 initial regression tests passed.
+//
+// Included:
+// - LAST / FIRST / HIGH / LOW note priority
+// - Input filtering: ALL or MIDI channel 1–16
+// - One selectable output channel
+// - Classic transitions
+// - Duplicate Note On / Note Off protection
+// - Selected-channel panic
+// - 16-pad / 4-knob test interface
+//
+// Joe Novelli & ChatGPT ("Clem")
+// Keep making weird noises.
+// ============================================================================
+
+@OnLoad
+  ShowLayout 2
+  SetShortName {MGM011}
+  LabelKnobs {MONOGLIDE MATRIX v0.1.1}
+  LabelPads {STABLE CORE ENGINE}
+
+  FillArray heldCount, 0, 128
+  FillArray lastVelocity, 0, 128
+  FillArray firstOrder, 0, 128
+  FillArray lastOrder, 0, 128
+  ResetNoteStates
+
+  currentValid = NO
+  currentNote = 0
+  currentVelocity = 0
+  desiredValid = NO
+  desiredNote = 0
+  desiredVelocity = 0
+  heldPitchCount = 0
+  pressCounter = 1
+
+  priorityMode = 0
+  inputMode = 0
+  outputChannel = 0
+  debugEnabled = NO
+
+  SetKnobValue 0, 0
+  SetKnobValue 1, 0
+  SetKnobValue 2, 0
+  SetKnobValue 3, 0
+
+  LabelPad 0, {PANIC}
+  LabelPad 1, {NOW --}
+  LabelPad 2, {HELD 0}
+  LabelPad 3, {PR LAST}
+  LabelPad 4, {IN ALL}
+  LabelPad 5, {OUT 1}
+  LabelPad 6, {MONO}
+  LabelPad 7, {CLASSIC}
+  LabelPad 8, {TEST 1}
+  LabelPad 9, {C > E}
+  LabelPad 10, {REL E}
+  LabelPad 11, {BACK C}
+  LabelPad 12, {v0.1.1}
+  LabelPad 13, {CORE}
+  LabelPad 14, {NO GLIDE}
+  LabelPad 15, {ROCK}
+
+  Call @UpdateKnobLabels
+  Call @UpdateStatus
+
+  Log {MonoGlide Matrix v0.1.1 loaded}
+  Log {Classic mono engine only}
+  Log {Default output channel: 1}
+@End
+
+@OnMidiNoteOn
+  eventChannel = MIDIChannel
+  eventNote = MIDINote
+  eventVelocity = MIDIVelocity
+
+  Call @CheckInputAccepted
+
+  if inputAccepted
+    sourceWasHeld = GetNoteState eventChannel, eventNote
+
+    if sourceWasHeld = 0
+      SetNoteState eventChannel, eventNote, 1
+      heldCount[eventNote] = heldCount[eventNote] + 1
+
+      if heldCount[eventNote] = 1
+        heldPitchCount = heldPitchCount + 1
+        firstOrder[eventNote] = pressCounter
+      endif
+    endif
+
+    lastOrder[eventNote] = pressCounter
+    lastVelocity[eventNote] = eventVelocity
+    pressCounter = pressCounter + 1
+
+    Call @ResolvePriority
+    Call @ReconcileCurrentNote
+    Call @UpdateStatus
+
+    if debugEnabled
+      Log {ON ch}, eventChannel + 1
+      Log {Note }, eventNote
+      Log {Held pitches }, heldPitchCount
+    endif
+  endif
+@End
+
+@OnMidiNoteOff
+  eventChannel = MIDIChannel
+  eventNote = MIDINote
+
+  Call @CheckInputAccepted
+
+  if inputAccepted
+    sourceWasHeld = GetNoteState eventChannel, eventNote
+
+    if sourceWasHeld <> 0
+      SetNoteState eventChannel, eventNote, 0
+      heldCount[eventNote] = heldCount[eventNote] - 1
+
+      if heldCount[eventNote] < 0
+        heldCount[eventNote] = 0
+      endif
+
+      if heldCount[eventNote] = 0
+        heldPitchCount = heldPitchCount - 1
+
+        if heldPitchCount < 0
+          heldPitchCount = 0
+        endif
+      endif
+
+      Call @ResolvePriority
+      Call @ReconcileCurrentNote
+      Call @UpdateStatus
+
+      if debugEnabled
+        Log {OFF ch}, eventChannel + 1
+        Log {Note }, eventNote
+        Log {Held pitches }, heldPitchCount
+      endif
+
+    elseif debugEnabled
+      Log {Ignored unmatched Note Off}
+      Log {Channel }, eventChannel + 1
+      Log {Note }, eventNote
+    endif
+  endif
+@End
+
+@OnKnobChange
+  changedKnob = LastKnob
+  changedValue = GetKnobValue changedKnob
+
+  if changedKnob = 0
+    priorityMode = RoundDown (changedValue / 32)
+
+    if priorityMode > 3
+      priorityMode = 3
+    endif
+
+    Call @ResolvePriority
+    Call @ReconcileCurrentNote
+
+  elseif changedKnob = 1
+    newInputMode = Round (changedValue * 16 / 127)
+
+    if newInputMode <> inputMode
+      if currentValid
+        SendMIDINoteOff outputChannel, currentNote, 0
+      endif
+
+      SendMIDICC outputChannel, 123, 0
+      Call @ResetEngine
+      inputMode = newInputMode
+    endif
+
+  elseif changedKnob = 2
+    newOutputChannel = Round (changedValue * 15 / 127)
+
+    if newOutputChannel <> outputChannel
+      oldOutputChannel = outputChannel
+
+      if currentValid
+        SendMIDINoteOff oldOutputChannel, currentNote, 0
+      endif
+
+      SendMIDICC oldOutputChannel, 123, 0
+      outputChannel = newOutputChannel
+
+      if currentValid
+        SendMIDINoteOn outputChannel, currentNote, currentVelocity
+      endif
+
+      if debugEnabled
+        Log {Output changed to channel }, outputChannel + 1
+      endif
+    endif
+
+  elseif changedKnob = 3
+    if changedValue >= 64
+      debugEnabled = YES
+    else
+      debugEnabled = NO
+    endif
+  endif
+
+  Call @UpdateKnobLabels
+  Call @UpdateStatus
+@End
+
+@OnPadDown
+  if LastPad = 0
+    Call @PanicSelected
+  endif
+@End
+
+@CheckInputAccepted
+  inputAccepted = NO
+
+  if inputMode = 0
+    inputAccepted = YES
+  elseif eventChannel = (inputMode - 1)
+    inputAccepted = YES
+  endif
+@End
+
+@ResolvePriority
+  desiredValid = NO
+  desiredNote = 0
+  desiredVelocity = 0
+
+  if heldPitchCount > 0
+    if priorityMode = 0
+      bestOrder = -1
+
+      for scanNote = 0 to 127
+        if heldCount[scanNote] > 0
+          if lastOrder[scanNote] > bestOrder
+            bestOrder = lastOrder[scanNote]
+            desiredNote = scanNote
+            desiredValid = YES
+          endif
+        endif
+      endfor
+
+    elseif priorityMode = 1
+      bestOrder = 10000000
+
+      for scanNote = 0 to 127
+        if heldCount[scanNote] > 0
+          if firstOrder[scanNote] < bestOrder
+            bestOrder = firstOrder[scanNote]
+            desiredNote = scanNote
+            desiredValid = YES
+          endif
+        endif
+      endfor
+
+    elseif priorityMode = 2
+      for scanNote = 0 to 127
+        if heldCount[scanNote] > 0
+          desiredNote = scanNote
+          desiredValid = YES
+        endif
+      endfor
+
+    else
+      lowFound = NO
+
+      for scanNote = 0 to 127
+        if heldCount[scanNote] > 0
+          if lowFound = NO
+            desiredNote = scanNote
+            desiredValid = YES
+            lowFound = YES
+          endif
+        endif
+      endfor
+    endif
+
+    if desiredValid
+      desiredVelocity = lastVelocity[desiredNote]
+    endif
+  endif
+@End
+
+@ReconcileCurrentNote
+  if currentValid = NO and desiredValid = YES
+    SendMIDINoteOn outputChannel, desiredNote, desiredVelocity
+    currentNote = desiredNote
+    currentVelocity = desiredVelocity
+    currentValid = YES
+
+  elseif currentValid = YES and desiredValid = NO
+    SendMIDINoteOff outputChannel, currentNote, 0
+    currentValid = NO
+    currentVelocity = 0
+
+  elseif currentValid = YES and desiredValid = YES
+    if currentNote <> desiredNote
+      SendMIDINoteOff outputChannel, currentNote, 0
+      SendMIDINoteOn outputChannel, desiredNote, desiredVelocity
+      currentNote = desiredNote
+      currentVelocity = desiredVelocity
+    endif
+  endif
+@End
+
+@PanicSelected
+  if currentValid
+    SendMIDINoteOff outputChannel, currentNote, 0
+  endif
+
+  SendMIDICC outputChannel, 123, 0
+  SendMIDICC outputChannel, 120, 0
+  Call @ResetEngine
+  FlashPad 0
+
+  Log {PANIC SELECTED}
+  Log {Output channel }, outputChannel + 1
+@End
+
+@ResetEngine
+  ResetNoteStates
+  FillArray heldCount, 0, 128
+  FillArray lastVelocity, 0, 128
+  FillArray firstOrder, 0, 128
+  FillArray lastOrder, 0, 128
+
+  currentValid = NO
+  currentNote = 0
+  currentVelocity = 0
+  desiredValid = NO
+  desiredNote = 0
+  desiredVelocity = 0
+  heldPitchCount = 0
+  pressCounter = 1
+
+  Call @UpdateStatus
+@End
+
+@UpdateKnobLabels
+  if priorityMode = 0
+    LabelKnob 0, {PR LAST}
+  elseif priorityMode = 1
+    LabelKnob 0, {PR FIRST}
+  elseif priorityMode = 2
+    LabelKnob 0, {PR HIGH}
+  else
+    LabelKnob 0, {PR LOW}
+  endif
+
+  if inputMode = 0
+    LabelKnob 1, {IN ALL}
+  else
+    LabelKnob 1, {IN }, inputMode
+  endif
+
+  LabelKnob 2, {OUT }, outputChannel + 1
+
+  if debugEnabled
+    LabelKnob 3, {DBG ON}
+  else
+    LabelKnob 3, {DBG OFF}
+  endif
+@End
+
+@UpdateStatus
+  if currentValid
+    LabelPad 1, {NOW }, (NoteName currentNote, YES)
+  else
+    LabelPad 1, {NOW --}
+  endif
+
+  LabelPad 2, {HELD }, heldPitchCount
+
+  if priorityMode = 0
+    LabelPad 3, {PR LAST}
+  elseif priorityMode = 1
+    LabelPad 3, {PR FIRST}
+  elseif priorityMode = 2
+    LabelPad 3, {PR HIGH}
+  else
+    LabelPad 3, {PR LOW}
+  endif
+
+  if inputMode = 0
+    LabelPad 4, {IN ALL}
+  else
+    LabelPad 4, {IN }, inputMode
+  endif
+
+  LabelPad 5, {OUT }, outputChannel + 1
+  LabelPad 6, {MONO}
+  LabelPad 7, {CLASSIC}
+@End

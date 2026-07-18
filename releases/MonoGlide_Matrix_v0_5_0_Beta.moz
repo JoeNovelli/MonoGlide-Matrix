@@ -1,0 +1,1436 @@
+// ============================================================================
+// MONOGLIDE MATRIX v0.5.0 BETA
+// ============================================================================
+//
+// PERFORMANCE STATE AUDIO ALPHA
+//   - MONO / WATCH 2 use a fixed short Tonic handoff
+//   - ANCHORED / WATCH 1 enable selected Voice release timing
+//   - Foundation exits remain short in all Tonic states
+//   - State observation occurs before note reconciliation
+//
+//
+// ROLE-SET REWRITE
+//   - Compare old and new active pitch sets before assigning roles
+//   - STAY and role-change pitches generate no MIDI
+//   - ENTER pitches start before EXIT pitches are released
+//   - Voice exits use Classic / Overlap / Bloom timing
+//   - Foundation movement uses a short 24 ms handoff
+//   - Releasing the complete performance uses selected transition timing
+//
+// NEW
+//   - TONIC priority: protected lowest-held bass anchor
+//   - Higher notes use LAST priority as an independent lead voice
+//   - Cleaner, shorter knob and pad labels
+//
+// TRANSITIONS
+//   - CLASSIC
+//   - OVERLAP (0–500 ms musical taper)
+//   - BLOOM (0–2000 ms extended taper)
+//
+// TONIC TEST BEHAVIOR
+//   Hold a low note. Higher notes may glide/bloom above it.
+//   The low anchor remains sounding until physically released.
+//   A newly played lower note becomes the new anchor.
+//
+// Beta release: one selectable output channel, all input channels.
+// ============================================================================
+
+@OnLoad
+
+  ShowLayout 2
+  SetShortName {MGM050}
+  LabelKnobs {MONOGLIDE MATRIX v0.5.0 BETA}
+  LabelPads {MONOGLIDE MATRIX}
+
+  FillArray heldCount, 0, 128
+  FillArray lastVelocity, 0, 128
+  FillArray firstOrder, 0, 128
+  FillArray lastOrder, 0, 128
+  FillArray noteGeneration, 0, 128
+  ResetNoteStates
+
+  queueSize = 32
+  FillArray queueActive, 0, queueSize
+  FillArray queueNote, 0, queueSize
+  FillArray queueChannel, 0, queueSize
+  FillArray queueGeneration, 0, queueSize
+  FillArray queueDueTick, 0, queueSize
+  queueCount = 0
+  timerTick = 0
+
+  // Performance-state diagnostic:
+  // 0 MONO, 1 WATCH 2, 2 ANCHORED, 3 WATCH 1
+  performanceState = 0
+  stateDeadlineTick = 0
+  anchorEnterMs = 30
+  anchorExitMs = 90
+
+  currentValid = NO
+  currentNote = 0
+  currentVelocity = 0
+  desiredValid = NO
+  desiredNote = 0
+  desiredVelocity = 0
+
+  anchorValid = NO
+  anchorNote = 0
+  anchorVelocity = 0
+  desiredAnchorValid = NO
+  desiredAnchorNote = 0
+  desiredAnchorVelocity = 0
+
+  leadValid = NO
+  leadNote = 0
+  leadVelocity = 0
+  desiredLeadValid = NO
+  desiredLeadNote = 0
+  desiredLeadVelocity = 0
+
+  heldPitchCount = 0
+  pressCounter = 1
+  restartHandled = NO
+
+  // Re-entry diagnostic state. Display only; no musical behavior change.
+  diagnosticEventCount = 0
+  diagnosticIncomingNote = 0
+  diagnosticCanceledCount = 0
+  diagnosticRestart = NO
+  diagnosticWasActive = NO
+  diagnosticOwnershipForced = NO
+
+  // 0 LAST, 1 FIRST, 2 HIGH, 3 LOW, 4 TONIC
+  priorityMode = 0
+
+  // 0 CLASSIC, 1 OVERLAP, 2 BLOOM
+  transitionMode = 0
+
+  overlapRaw = 21
+  overlapMs = 0
+
+  // Tight Foundation handoff used while another active role remains.
+  foundationReleaseMs = 24
+
+  // Displayed output channel 2.
+  outputChannel = 1
+
+  SetKnobValue 0, 0
+  SetKnobValue 1, 0
+  SetKnobValue 2, overlapRaw
+  SetKnobValue 3, 8
+
+  LabelPad 0, {PANIC}
+  LabelPad 1, {NOW --}
+  LabelPad 2, {HELD 0}
+  LabelPad 3, {LAST}
+  LabelPad 4, {CLASSIC}
+  LabelPad 5, {N/A}
+  LabelPad 6, {OUT 2}
+  LabelPad 7, {Q 0}
+  LabelPad 8, {LEAD --}
+  LabelPad 9, {BASS --}
+  LabelPad 10, {MONO}
+  LabelPad 11, {STATUS}
+  LabelPad 12, {v0.5.0}
+  LabelPad 13, {BETA}
+  LabelPad 14, {MGM}
+  LabelPad 15, {READY}
+
+  Call @CalculateDuration
+  Call @UpdateLabels
+  Call @UpdateStatus
+  Call @UpdateDiagnosticPads
+
+  SetTimerInterval 1
+  StartTimer
+
+  Log {MonoGlide Matrix v0.5.0 Beta loaded}
+  Log {Stable beta engine: Classic / Overlap / Bloom}
+@End
+
+
+// ============================================================================
+// MIDI INPUT
+// ============================================================================
+
+@OnMidiNoteOn
+
+  eventChannel = MIDIChannel
+  eventNote = MIDINote
+  eventVelocity = MIDIVelocity
+
+  diagnosticEventCount = diagnosticEventCount + 1
+  diagnosticIncomingNote = eventNote
+  diagnosticWasActive = NO
+  diagnosticOwnershipForced = NO
+
+  if currentValid
+    if currentNote = eventNote
+      diagnosticWasActive = YES
+    endif
+  endif
+
+  if anchorValid
+    if anchorNote = eventNote
+      diagnosticWasActive = YES
+    endif
+  endif
+
+  if leadValid
+    if leadNote = eventNote
+      diagnosticWasActive = YES
+    endif
+  endif
+
+  // A physical Note On is authoritative.
+  // If this pitch is still in queued release, close that old articulation
+  // and start the new one immediately before role reconciliation.
+  restartHandled = NO
+
+  Call @CancelQueuedReleasesForEventNote
+
+  if canceledCount > 0
+
+    SendMIDINoteOff outputChannel, eventNote, 0
+
+    noteGeneration[eventNote] = noteGeneration[eventNote] + 1
+    SendMIDINoteOn outputChannel, eventNote, eventVelocity
+
+    restartHandled = YES
+
+  endif
+
+  diagnosticCanceledCount = canceledCount
+  diagnosticRestart = restartHandled
+
+  sourceWasHeld = GetNoteState eventChannel, eventNote
+
+  if sourceWasHeld = 0
+    SetNoteState eventChannel, eventNote, 1
+    heldCount[eventNote] = heldCount[eventNote] + 1
+
+    if heldCount[eventNote] = 1
+      heldPitchCount = heldPitchCount + 1
+      firstOrder[eventNote] = pressCounter
+    endif
+  endif
+
+  lastOrder[eventNote] = pressCounter
+  lastVelocity[eventNote] = eventVelocity
+  pressCounter = pressCounter + 1
+
+  Call @UpdatePerformanceObservation
+  Call @ResolveMusicalState
+  Call @ReconcileMusicalState
+
+  if restartHandled
+    Call @SynchronizeRestartOwnership
+  endif
+
+  Call @UpdateStatus
+  Call @UpdateDiagnosticPads
+
+  // Event-local guard; subsequent non-input operations must behave normally.
+  restartHandled = NO
+
+@End
+
+
+@OnMidiNoteOff
+
+  eventChannel = MIDIChannel
+  eventNote = MIDINote
+
+  sourceWasHeld = GetNoteState eventChannel, eventNote
+
+  if sourceWasHeld <> 0
+    SetNoteState eventChannel, eventNote, 0
+    heldCount[eventNote] = heldCount[eventNote] - 1
+
+    if heldCount[eventNote] < 0
+      heldCount[eventNote] = 0
+    endif
+
+    if heldCount[eventNote] = 0
+      heldPitchCount = heldPitchCount - 1
+
+      if heldPitchCount < 0
+        heldPitchCount = 0
+      endif
+    endif
+
+    Call @UpdatePerformanceObservation
+    Call @ResolveMusicalState
+    Call @ReconcileMusicalState
+    Call @UpdateStatus
+  endif
+
+@End
+
+
+// ============================================================================
+// TIMER / DELAYED RELEASE QUEUE
+// ============================================================================
+
+@OnTimer
+
+  timerTick = timerTick + 1
+
+  Call @ProcessPerformanceObservation
+
+  if queueCount > 0
+    for queueIndex = 0 to (queueSize - 1)
+
+      if queueActive[queueIndex]
+        if timerTick >= queueDueTick[queueIndex]
+
+          queuedNote = queueNote[queueIndex]
+          queuedChannel = queueChannel[queueIndex]
+          queuedGeneration = queueGeneration[queueIndex]
+
+          queueActive[queueIndex] = NO
+          queueCount = queueCount - 1
+          queueStillValid = NO
+
+          if noteGeneration[queuedNote] = queuedGeneration
+            queueStillValid = YES
+          endif
+
+          // Protect every note currently owned by either engine.
+          if currentValid
+            if currentNote = queuedNote
+              queueStillValid = NO
+            endif
+          endif
+
+          if anchorValid
+            if anchorNote = queuedNote
+              queueStillValid = NO
+            endif
+          endif
+
+          if leadValid
+            if leadNote = queuedNote
+              queueStillValid = NO
+            endif
+          endif
+
+          if queueStillValid
+            SendMIDINoteOff queuedChannel, queuedNote, 0
+          endif
+
+        endif
+      endif
+
+    endfor
+
+    if queueCount < 0
+      queueCount = 0
+    endif
+
+    Call @UpdateQueuePad
+  endif
+
+@End
+
+
+// ============================================================================
+// CONTROLS
+// ============================================================================
+
+@OnKnobChange
+
+  changedKnob = LastKnob
+  changedValue = GetKnobValue changedKnob
+
+  if changedKnob = 0
+
+    // Five equal-ish regions across 0–127.
+    newPriorityMode = RoundDown (changedValue / 26)
+
+    if newPriorityMode > 4
+      newPriorityMode = 4
+    endif
+
+    if newPriorityMode <> priorityMode
+      Call @SilenceOwnedVoices
+      priorityMode = newPriorityMode
+      performanceState = 0
+      stateDeadlineTick = 0
+      Call @ResolveMusicalState
+      Call @ReconcileMusicalState
+      Call @UpdatePerformanceObservation
+    endif
+
+  elseif changedKnob = 1
+
+    if changedValue < 43
+      transitionMode = 0
+    elseif changedValue < 86
+      transitionMode = 1
+    else
+      transitionMode = 2
+    endif
+
+    Call @CalculateDuration
+
+  elseif changedKnob = 2
+
+    overlapRaw = changedValue
+    Call @CalculateDuration
+
+  elseif changedKnob = 3
+
+    newOutputChannel = Round (changedValue * 15 / 127)
+
+    if newOutputChannel <> outputChannel
+      Call @SilenceOwnedVoices
+      SendMIDICC outputChannel, 123, 0
+      outputChannel = newOutputChannel
+      Call @ResolveMusicalState
+      Call @ReconcileMusicalState
+    endif
+
+  endif
+
+  Call @UpdateLabels
+  Call @UpdateStatus
+
+@End
+
+
+@OnPadDown
+
+  if LastPad = 0
+    Call @PanicSelected
+  endif
+
+@End
+
+
+// ============================================================================
+// RE-ENTRY OWNERSHIP SYNCHRONIZATION
+// The articulation layer may restart a pitch before reconciliation.
+// Reconciliation remains responsible for exits and role calculation.
+// This final check prevents a sounding restart from becoming unowned.
+// ============================================================================
+
+@SynchronizeRestartOwnership
+
+  restartIsOwned = NO
+
+  if priorityMode = 4
+
+    if anchorValid
+      if anchorNote = eventNote
+        restartIsOwned = YES
+      endif
+    endif
+
+    if leadValid
+      if leadNote = eventNote
+        restartIsOwned = YES
+      endif
+    endif
+
+    if restartIsOwned = NO
+
+      // A physical re-entry above the Foundation is authoritative as Voice.
+      // ResolveTonic should normally have selected it already; this is a
+      // defensive ownership repair, not another MIDI articulation.
+      if anchorValid
+        if eventNote <> anchorNote
+          leadValid = YES
+          leadNote = eventNote
+          leadVelocity = eventVelocity
+          restartIsOwned = YES
+          diagnosticOwnershipForced = YES
+        endif
+      else
+        anchorValid = YES
+        anchorNote = eventNote
+        anchorVelocity = eventVelocity
+        restartIsOwned = YES
+        diagnosticOwnershipForced = YES
+      endif
+
+    endif
+
+  else
+
+    if currentValid
+      if currentNote = eventNote
+        restartIsOwned = YES
+      endif
+    endif
+
+    if restartIsOwned = NO
+      currentValid = YES
+      currentNote = eventNote
+      currentVelocity = eventVelocity
+      restartIsOwned = YES
+      diagnosticOwnershipForced = YES
+    endif
+
+  endif
+
+@End
+
+
+// ============================================================================
+// RESOLVER DISPATCH
+// ============================================================================
+
+@ResolveMusicalState
+
+  if priorityMode = 4
+    Call @ResolveTonic
+  else
+    Call @ResolvePriority
+  endif
+
+@End
+
+
+@ReconcileMusicalState
+
+  if priorityMode = 4
+    Call @ReconcileTonic
+  else
+    Call @ReconcileCurrentNote
+  endif
+
+@End
+
+
+// ============================================================================
+// STANDARD PRIORITY RESOLVER
+// ============================================================================
+
+@ResolvePriority
+
+  desiredValid = NO
+  desiredNote = 0
+  desiredVelocity = 0
+
+  if heldPitchCount > 0
+
+    if priorityMode = 0
+
+      bestOrder = -1
+
+      for scanNote = 0 to 127
+        if heldCount[scanNote] > 0
+          if lastOrder[scanNote] > bestOrder
+            bestOrder = lastOrder[scanNote]
+            desiredNote = scanNote
+            desiredValid = YES
+          endif
+        endif
+      endfor
+
+    elseif priorityMode = 1
+
+      bestOrder = 10000000
+
+      for scanNote = 0 to 127
+        if heldCount[scanNote] > 0
+          if firstOrder[scanNote] < bestOrder
+            bestOrder = firstOrder[scanNote]
+            desiredNote = scanNote
+            desiredValid = YES
+          endif
+        endif
+      endfor
+
+    elseif priorityMode = 2
+
+      for scanNote = 0 to 127
+        if heldCount[scanNote] > 0
+          desiredNote = scanNote
+          desiredValid = YES
+        endif
+      endfor
+
+    else
+
+      lowFound = NO
+
+      for scanNote = 0 to 127
+        if heldCount[scanNote] > 0
+          if lowFound = NO
+            desiredNote = scanNote
+            desiredValid = YES
+            lowFound = YES
+          endif
+        endif
+      endfor
+
+    endif
+
+    if desiredValid
+      desiredVelocity = lastVelocity[desiredNote]
+    endif
+  endif
+
+@End
+
+
+// ============================================================================
+// TONIC RESOLVER
+// Lowest held pitch is the anchor.
+// Most recently played remaining pitch is the lead.
+// ============================================================================
+
+@ResolveTonic
+
+  desiredAnchorValid = NO
+  desiredAnchorNote = 0
+  desiredAnchorVelocity = 0
+
+  desiredLeadValid = NO
+  desiredLeadNote = 0
+  desiredLeadVelocity = 0
+
+  // Find lowest held pitch.
+  anchorFound = NO
+
+  for scanNote = 0 to 127
+    if heldCount[scanNote] > 0
+      if anchorFound = NO
+        desiredAnchorNote = scanNote
+        desiredAnchorVelocity = lastVelocity[scanNote]
+        desiredAnchorValid = YES
+        anchorFound = YES
+      endif
+    endif
+  endfor
+
+  // Find LAST-priority lead, excluding the anchor.
+  if desiredAnchorValid
+
+    bestOrder = -1
+
+    for scanNote = 0 to 127
+      if heldCount[scanNote] > 0
+        if scanNote <> desiredAnchorNote
+          if lastOrder[scanNote] > bestOrder
+            bestOrder = lastOrder[scanNote]
+            desiredLeadNote = scanNote
+            desiredLeadVelocity = lastVelocity[scanNote]
+            desiredLeadValid = YES
+          endif
+        endif
+      endif
+    endfor
+
+  endif
+
+@End
+
+
+// ============================================================================
+// STANDARD MONO RECONCILIATION
+// ============================================================================
+
+@ReconcileCurrentNote
+
+  if currentValid = NO and desiredValid = YES
+
+    startAlreadyHandled = NO
+
+    if restartHandled
+      if desiredNote = eventNote
+        startAlreadyHandled = YES
+      endif
+    endif
+
+    if startAlreadyHandled = NO
+      noteGeneration[desiredNote] = noteGeneration[desiredNote] + 1
+      SendMIDINoteOn outputChannel, desiredNote, desiredVelocity
+    endif
+
+    currentNote = desiredNote
+    currentVelocity = desiredVelocity
+    currentValid = YES
+
+  elseif currentValid = YES and desiredValid = NO
+
+    SendMIDINoteOff outputChannel, currentNote, 0
+    currentValid = NO
+
+  elseif currentValid = YES and desiredValid = YES
+
+    if currentNote <> desiredNote
+      oldNote = currentNote
+      newNote = desiredNote
+      newVelocity = desiredVelocity
+      Call @PerformTransition
+      currentNote = newNote
+      currentVelocity = newVelocity
+      currentValid = YES
+    endif
+
+  endif
+
+@End
+
+
+// ============================================================================
+// TONIC RECONCILIATION
+// ============================================================================
+
+@ReconcileTonic
+
+  oldAnchorValid = anchorValid
+  oldAnchorNote = anchorNote
+  oldLeadValid = leadValid
+  oldLeadNote = leadNote
+
+  newRoleCount = 0
+
+  if desiredAnchorValid
+    newRoleCount = newRoleCount + 1
+  endif
+
+  if desiredLeadValid
+    newRoleCount = newRoleCount + 1
+  endif
+
+  // ENTERS FIRST
+
+  if desiredAnchorValid
+
+    anchorWasActive = NO
+
+    if oldAnchorValid
+      if oldAnchorNote = desiredAnchorNote
+        anchorWasActive = YES
+      endif
+    endif
+
+    if oldLeadValid
+      if oldLeadNote = desiredAnchorNote
+        anchorWasActive = YES
+      endif
+    endif
+
+    if anchorWasActive = NO
+
+      anchorStartHandled = NO
+
+      if restartHandled
+        if desiredAnchorNote = eventNote
+          anchorStartHandled = YES
+        endif
+      endif
+
+      if anchorStartHandled = NO
+        noteGeneration[desiredAnchorNote] = noteGeneration[desiredAnchorNote] + 1
+        SendMIDINoteOn outputChannel, desiredAnchorNote, desiredAnchorVelocity
+      endif
+
+    endif
+
+  endif
+
+  if desiredLeadValid
+
+    leadWasActive = NO
+
+    if oldAnchorValid
+      if oldAnchorNote = desiredLeadNote
+        leadWasActive = YES
+      endif
+    endif
+
+    if oldLeadValid
+      if oldLeadNote = desiredLeadNote
+        leadWasActive = YES
+      endif
+    endif
+
+    if leadWasActive = NO
+
+      leadStartHandled = NO
+
+      if restartHandled
+        if desiredLeadNote = eventNote
+          leadStartHandled = YES
+        endif
+      endif
+
+      if leadStartHandled = NO
+        noteGeneration[desiredLeadNote] = noteGeneration[desiredLeadNote] + 1
+        SendMIDINoteOn outputChannel, desiredLeadNote, desiredLeadVelocity
+      endif
+
+    endif
+
+  endif
+
+  // OLD FOUNDATION EXIT
+
+  if oldAnchorValid
+
+    oldAnchorStays = NO
+
+    if desiredAnchorValid
+      if oldAnchorNote = desiredAnchorNote
+        oldAnchorStays = YES
+      endif
+    endif
+
+    if desiredLeadValid
+      if oldAnchorNote = desiredLeadNote
+        oldAnchorStays = YES
+      endif
+    endif
+
+    if oldAnchorStays = NO
+
+      oldNote = oldAnchorNote
+
+      if newRoleCount = 0
+        Call @ReleaseVoiceExit
+      else
+        Call @ReleaseFoundationExit
+      endif
+
+    endif
+
+  endif
+
+  // OLD VOICE EXIT
+
+  if oldLeadValid
+
+    processOldLead = YES
+
+    if oldAnchorValid
+      if oldLeadNote = oldAnchorNote
+        processOldLead = NO
+      endif
+    endif
+
+    if processOldLead
+
+      oldLeadStays = NO
+
+      if desiredAnchorValid
+        if oldLeadNote = desiredAnchorNote
+          oldLeadStays = YES
+        endif
+      endif
+
+      if desiredLeadValid
+        if oldLeadNote = desiredLeadNote
+          oldLeadStays = YES
+        endif
+      endif
+
+      if oldLeadStays = NO
+        oldNote = oldLeadNote
+        Call @ReleaseVoiceExit
+      endif
+
+    endif
+
+  endif
+
+  // ASSIGN NEW ROLES
+
+  anchorValid = desiredAnchorValid
+
+  if desiredAnchorValid
+    anchorNote = desiredAnchorNote
+    anchorVelocity = desiredAnchorVelocity
+  endif
+
+  leadValid = desiredLeadValid
+
+  if desiredLeadValid
+    leadNote = desiredLeadNote
+    leadVelocity = desiredLeadVelocity
+  endif
+
+@End
+
+
+@ReleaseVoiceExit
+
+  // In TONIC, long Voice release is enabled only when anchored intent
+  // has been confirmed or is being held through the exit grace period.
+  if priorityMode = 4
+
+    if performanceState = 2 or performanceState = 3
+
+      if transitionMode = 0
+
+        SendMIDINoteOff outputChannel, oldNote, 0
+
+      else
+
+        if overlapMs > 0
+          releaseDelayMs = overlapMs
+          Call @QueueRoleNoteOff
+        else
+          SendMIDINoteOff outputChannel, oldNote, 0
+        endif
+
+      endif
+
+    else
+
+      // MONO and WATCH 2 use the short internal handoff.
+      releaseDelayMs = foundationReleaseMs
+      Call @QueueRoleNoteOff
+
+    endif
+
+  else
+
+    // Defensive fallback; standard priorities normally use PerformTransition.
+    if transitionMode = 0
+
+      SendMIDINoteOff outputChannel, oldNote, 0
+
+    else
+
+      if overlapMs > 0
+        releaseDelayMs = overlapMs
+        Call @QueueRoleNoteOff
+      else
+        SendMIDINoteOff outputChannel, oldNote, 0
+      endif
+
+    endif
+
+  endif
+
+@End
+
+@ReleaseFoundationExit
+
+  if foundationReleaseMs > 0
+    releaseDelayMs = foundationReleaseMs
+    Call @QueueRoleNoteOff
+  else
+    SendMIDINoteOff outputChannel, oldNote, 0
+  endif
+
+@End
+
+
+@QueueRoleNoteOff
+
+  freeSlot = -1
+
+  for queueIndex = 0 to (queueSize - 1)
+
+    if queueActive[queueIndex] = NO
+      if freeSlot = -1
+        freeSlot = queueIndex
+      endif
+    endif
+
+  endfor
+
+  if freeSlot >= 0
+
+    queueActive[freeSlot] = YES
+    queueNote[freeSlot] = oldNote
+    queueChannel[freeSlot] = outputChannel
+    queueGeneration[freeSlot] = noteGeneration[oldNote]
+    queueDueTick[freeSlot] = timerTick + releaseDelayMs
+    queueCount = queueCount + 1
+
+  else
+
+    SendMIDINoteOff outputChannel, oldNote, 0
+    Log {WARNING: role release queue full}
+
+  endif
+
+  Call @UpdateQueuePad
+
+@End
+
+// ============================================================================
+// SHARED TRANSITION
+// Uses globals oldNote, newNote, newVelocity.
+// ============================================================================
+
+@PerformTransition
+
+  transitionStartHandled = NO
+
+  if restartHandled
+    if newNote = eventNote
+      transitionStartHandled = YES
+    endif
+  endif
+
+  if transitionMode = 0
+
+    SendMIDINoteOff outputChannel, oldNote, 0
+
+    if transitionStartHandled = NO
+      noteGeneration[newNote] = noteGeneration[newNote] + 1
+      SendMIDINoteOn outputChannel, newNote, newVelocity
+    endif
+
+  else
+
+    if transitionStartHandled = NO
+      noteGeneration[newNote] = noteGeneration[newNote] + 1
+      SendMIDINoteOn outputChannel, newNote, newVelocity
+    endif
+
+    if overlapMs > 0
+      Call @QueueOldNoteOff
+    else
+      SendMIDINoteOff outputChannel, oldNote, 0
+    endif
+
+  endif
+
+@End
+
+
+// ============================================================================
+// QUEUE
+// ============================================================================
+
+@CancelQueuedReleasesForEventNote
+
+  // canceledCount is intentionally left available to @OnMidiNoteOn.
+  // A positive value means an older sounding articulation must be closed.
+  canceledCount = 0
+
+  for queueIndex = 0 to (queueSize - 1)
+
+    if queueActive[queueIndex]
+
+      if queueNote[queueIndex] = eventNote
+
+        queueActive[queueIndex] = NO
+        canceledCount = canceledCount + 1
+
+      endif
+
+    endif
+
+  endfor
+
+  if canceledCount > 0
+
+    queueCount = queueCount - canceledCount
+
+    if queueCount < 0
+      queueCount = 0
+    endif
+
+    Call @UpdateQueuePad
+
+  endif
+
+@End
+
+
+@QueueOldNoteOff
+
+  freeSlot = -1
+
+  for queueIndex = 0 to (queueSize - 1)
+    if queueActive[queueIndex] = NO
+      if freeSlot = -1
+        freeSlot = queueIndex
+      endif
+    endif
+  endfor
+
+  if freeSlot >= 0
+
+    queueActive[freeSlot] = YES
+    queueNote[freeSlot] = oldNote
+    queueChannel[freeSlot] = outputChannel
+    queueGeneration[freeSlot] = noteGeneration[oldNote]
+    queueDueTick[freeSlot] = timerTick + overlapMs
+    queueCount = queueCount + 1
+
+  else
+
+    SendMIDINoteOff outputChannel, oldNote, 0
+    Log {WARNING: queue full}
+
+  endif
+
+  Call @UpdateQueuePad
+
+@End
+
+
+@FlushQueue
+
+  // Send every pending Note Off before clearing the queue.
+  // Used when rebuilding Tonic roles so no blooming note is orphaned.
+  for queueIndex = 0 to (queueSize - 1)
+
+    if queueActive[queueIndex]
+
+      SendMIDINoteOff queueChannel[queueIndex], queueNote[queueIndex], 0
+      queueActive[queueIndex] = NO
+
+    endif
+
+  endfor
+
+  queueCount = 0
+  Call @UpdateQueuePad
+
+@End
+
+
+@ClearQueue
+
+  FillArray queueActive, 0, queueSize
+  queueCount = 0
+  Call @UpdateQueuePad
+
+@End
+
+
+// ============================================================================
+// SILENCE / PANIC / RESET
+// ============================================================================
+
+@SilenceOwnedVoices
+
+  if currentValid
+    SendMIDINoteOff outputChannel, currentNote, 0
+  endif
+
+  if anchorValid
+    SendMIDINoteOff outputChannel, anchorNote, 0
+  endif
+
+  if leadValid
+    if leadNote <> anchorNote
+      SendMIDINoteOff outputChannel, leadNote, 0
+    endif
+  endif
+
+  Call @FlushQueue
+
+  currentValid = NO
+  anchorValid = NO
+  leadValid = NO
+
+@End
+
+
+@PanicSelected
+
+  Call @SilenceOwnedVoices
+  SendMIDICC outputChannel, 123, 0
+  SendMIDICC outputChannel, 120, 0
+
+  // Defensive explicit sweep catches any note that escaped ownership tracking.
+  for panicNote = 0 to 127
+    SendMIDINoteOff outputChannel, panicNote, 0
+  endfor
+
+  Call @ResetEngine
+  FlashPad 0
+  Log {PANIC SELECTED}
+@End
+
+
+@ResetEngine
+
+  ResetNoteStates
+  FillArray heldCount, 0, 128
+  FillArray lastVelocity, 0, 128
+  FillArray firstOrder, 0, 128
+  FillArray lastOrder, 0, 128
+
+  currentValid = NO
+  desiredValid = NO
+  anchorValid = NO
+  desiredAnchorValid = NO
+  leadValid = NO
+  desiredLeadValid = NO
+
+  heldPitchCount = 0
+  pressCounter = 1
+
+  performanceState = 0
+  stateDeadlineTick = 0
+
+  diagnosticIncomingNote = 0
+  diagnosticCanceledCount = 0
+  diagnosticRestart = NO
+  diagnosticWasActive = NO
+  diagnosticOwnershipForced = NO
+
+  Call @UpdateStatus
+  Call @UpdateDiagnosticPads
+
+@End
+
+
+// ============================================================================
+// PERFORMANCE-STATE DIAGNOSTIC
+// Observes intent without changing MIDI behavior.
+// ============================================================================
+
+@UpdatePerformanceObservation
+
+  if priorityMode <> 4
+
+    performanceState = 0
+    stateDeadlineTick = 0
+
+  elseif performanceState = 0
+
+    if heldPitchCount >= 2
+      performanceState = 1
+      stateDeadlineTick = timerTick + anchorEnterMs
+    endif
+
+  elseif performanceState = 1
+
+    if heldPitchCount < 2
+      performanceState = 0
+      stateDeadlineTick = 0
+    endif
+
+  elseif performanceState = 2
+
+    if heldPitchCount < 2
+      performanceState = 3
+      stateDeadlineTick = timerTick + anchorExitMs
+    endif
+
+  else
+
+    if heldPitchCount >= 2
+      performanceState = 2
+      stateDeadlineTick = 0
+    endif
+
+  endif
+
+@End
+
+
+@ProcessPerformanceObservation
+
+  stateChanged = NO
+
+  if priorityMode <> 4
+
+    if performanceState <> 0
+      performanceState = 0
+      stateDeadlineTick = 0
+      stateChanged = YES
+    endif
+
+  elseif performanceState = 1
+
+    if timerTick >= stateDeadlineTick
+
+      if heldPitchCount >= 2
+        performanceState = 2
+      else
+        performanceState = 0
+      endif
+
+      stateDeadlineTick = 0
+      stateChanged = YES
+
+    endif
+
+  elseif performanceState = 3
+
+    if timerTick >= stateDeadlineTick
+
+      if heldPitchCount >= 2
+        performanceState = 2
+      else
+        performanceState = 0
+      endif
+
+      stateDeadlineTick = 0
+      stateChanged = YES
+
+    endif
+
+  endif
+
+  if stateChanged
+    Call @UpdateStatus
+  endif
+
+@End
+
+
+// ============================================================================
+// DURATION CURVES
+// ============================================================================
+
+@CalculateDuration
+
+  if transitionMode = 0
+
+    overlapMs = 0
+
+  elseif transitionMode = 1
+
+    if overlapRaw <= 63
+      overlapMs = Round (overlapRaw * 60 / 63)
+    else
+      overlapUpper = overlapRaw - 63
+      overlapMs = Round (60 + (overlapUpper * overlapUpper * 440 / 4096))
+    endif
+
+  else
+
+    if overlapRaw <= 63
+      overlapMs = Round (overlapRaw * 250 / 63)
+    else
+      overlapUpper = overlapRaw - 63
+      overlapMs = Round (250 + (overlapUpper * overlapUpper * 1750 / 4096))
+    endif
+
+  endif
+
+@End
+
+
+// ============================================================================
+// UI
+// ============================================================================
+
+@UpdateLabels
+
+  if priorityMode = 0
+    LabelKnob 0, {LAST}
+  elseif priorityMode = 1
+    LabelKnob 0, {FIRST}
+  elseif priorityMode = 2
+    LabelKnob 0, {HIGH}
+  elseif priorityMode = 3
+    LabelKnob 0, {LOW}
+  else
+    LabelKnob 0, {TONIC}
+  endif
+
+  if transitionMode = 0
+    LabelKnob 1, {CLASSIC}
+    LabelKnob 2, {N/A}
+  elseif transitionMode = 1
+    LabelKnob 1, {OVERLAP}
+    LabelKnob 2, overlapMs, {ms}
+  else
+    LabelKnob 1, {BLOOM}
+    LabelKnob 2, overlapMs, {ms}
+  endif
+
+  LabelKnob 3, {OUT }, outputChannel + 1
+
+@End
+
+
+@UpdateStatus
+
+  LabelPad 2, {HELD }, heldPitchCount
+
+  if priorityMode = 4
+
+    LabelPad 3, {TONIC}
+
+    if anchorValid
+      LabelPad 1, {BASS }, (NoteName anchorNote, YES)
+      LabelPad 9, {BASS }, (NoteName anchorNote, YES)
+    else
+      LabelPad 1, {BASS --}
+      LabelPad 9, {BASS --}
+    endif
+
+    if leadValid
+      LabelPad 8, {LEAD }, (NoteName leadNote, YES)
+    else
+      LabelPad 8, {LEAD --}
+    endif
+
+  else
+
+    if currentValid
+      LabelPad 1, {NOW }, (NoteName currentNote, YES)
+    else
+      LabelPad 1, {NOW --}
+    endif
+
+    if priorityMode = 0
+      LabelPad 3, {LAST}
+    elseif priorityMode = 1
+      LabelPad 3, {FIRST}
+    elseif priorityMode = 2
+      LabelPad 3, {HIGH}
+    else
+      LabelPad 3, {LOW}
+    endif
+
+    LabelPad 8, {LEAD --}
+    LabelPad 9, {BASS --}
+
+  endif
+
+  if priorityMode = 4
+
+    if performanceState = 0
+      LabelPad 10, {MONO}
+    elseif performanceState = 1
+      LabelPad 10, {WATCH 2}
+    elseif performanceState = 2
+      LabelPad 10, {ANCHORED}
+    else
+      LabelPad 10, {WATCH 1}
+    endif
+
+  else
+
+    LabelPad 10, {MONO}
+
+  endif
+
+  if transitionMode = 0
+    LabelPad 4, {CLASSIC}
+    LabelPad 5, {N/A}
+  elseif transitionMode = 1
+    LabelPad 4, {OVERLAP}
+    LabelPad 5, overlapMs, {ms}
+  else
+    LabelPad 4, {BLOOM}
+    LabelPad 5, overlapMs, {ms}
+  endif
+
+  LabelPad 6, {OUT }, outputChannel + 1
+  Call @UpdateQueuePad
+
+@End
+
+
+@UpdateDiagnosticPads
+
+  // Production beta layout: diagnostic counters are intentionally hidden.
+
+@End
+
+
+@UpdateQueuePad
+
+  LabelPad 7, {Q }, queueCount
+
+@End

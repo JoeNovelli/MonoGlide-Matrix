@@ -1,0 +1,211 @@
+# Tonic Design Invariants
+
+*MonoGlide Matrix (MGM) — Tonic Architecture Draft*
+
+This document defines architectural invariants, not implementation details.
+
+The implementation may evolve, but these invariants should remain stable unless there is a compelling musical reason to revise them.
+---
+
+# Purpose
+
+Tonic is not simply another note priority mode.
+
+Unlike traditional monophonic note priority algorithms, Tonic interprets a
+performance as two independent musical roles:
+
+- Foundation
+- Voice
+
+These roles are dynamically assigned throughout a performance and are
+independent of the physical notes being played.
+
+Once assigned, Foundation and Voice operate as separate monophonic performers
+sharing a common keyboard input while maintaining independent transition
+behavior.
+
+This role-based architecture is intended to produce more musical, predictable,
+and extensible behavior than traditional monophonic priority systems.
+
+---
+
+# Design Philosophy
+
+The primary goal of Tonic is not to determine *which note wins*.
+
+Instead, its purpose is to interpret a player's musical intent by separating a
+performance into two complementary musical roles:
+
+- Foundation
+- Voice
+
+The resulting behavior should feel natural to musicians rather than exposing
+implementation details.
+
+Performance choices should describe musical outcomes rather than technical
+parameters.
+
+---
+
+# Tonic Design Invariants
+
+## Invariant 0 — Roles, Not Notes
+
+Foundation and Voice are independent musical roles, not note identities.
+
+Notes may assume or relinquish either role dynamically throughout a performance.
+
+No note permanently owns either role.
+
+---
+
+## Invariant 1 — One Foundation
+
+There shall never be more than one active Foundation.
+
+---
+
+## Invariant 2 — One Voice
+
+There shall never be more than one active Voice.
+
+---
+
+## Invariant 3 — Independent Performers
+
+Foundation and Voice behave as independent monophonic performers.
+
+Neither performer should directly manipulate the musical behavior of the other.
+
+---
+
+## Invariant 4 — Foundation Independence
+
+Foundation transitions shall never directly retrigger, restart, or interrupt the
+Voice.
+
+Changing Foundation should affect only Foundation.
+
+---
+
+## Invariant 5 — Voice Independence
+
+Voice transitions shall never directly retrigger, restart, or interrupt the
+Foundation.
+
+Changing Voice should affect only Voice.
+
+---
+
+## Invariant 6 — Deterministic Role Assignment
+
+Role assignment must always be deterministic.
+
+The same performed notes should always produce the same Foundation and Voice
+assignment regardless of transition timing.
+
+Transition behavior must never influence role assignment.
+
+Role assignment always occurs first.
+
+---
+
+## Invariant 7 — Direction Independence
+
+Ascending and descending melodic motion should behave identically.
+
+The engine should never depend upon melodic direction.
+
+---
+
+## Invariant 8 — Independent Transition Policies
+
+Foundation and Voice may use different transition policies.
+
+Current planned Foundation transition policies:
+
+- TNC Pedal
+- TNC Smooth
+
+Current Voice transition policy:
+
+- User-selected Transition Mode
+- User-selected Transition Time
+
+Future Foundation transition policies may be added without requiring changes to
+the underlying Tonic architecture.
+
+---
+
+# Planned Architecture
+
+```
+Keyboard Input
+        │
+        ▼
+ Role Resolver
+        │
+        ▼
+Performance State
+      ╱   ╲
+     ▼     ▼
+Foundation  Voice
+  Engine    Engine
+     │        │
+     ▼        ▼
+Foundation   Voice
+Transition   Transition
+ Policy       Policy
+      ╲      ╱
+       ▼    ▼
+     Output Merger
+          │
+          ▼
+      MIDI Output
+```
+
+---
+
+# Current Foundation Transition Policies
+
+## TNC Pedal
+
+Foundation transitions immediately.
+
+Produces clearly articulated Foundation movement while allowing Voice to use the
+selected Transition Mode and Transition Time.
+
+Ideal for:
+
+- Organ-style bass pedals
+- Articulated bass lines
+- Rhythmically defined Foundation movement
+
+---
+
+## TNC Smooth
+
+Foundation transitions using a short overlap intended to engage glide without
+producing a noticeable Foundation bloom.
+
+Voice behavior remains unchanged.
+
+Ideal for:
+
+- Expressive synth bass
+- Smooth bass movement
+- Fluid lead playing over a moving Foundation
+
+---
+
+# Architectural Principle
+
+The Role Resolver determines *what* each performer should do.
+
+Each performer independently determines *how* to perform its assigned role.
+
+Only after both performers have completed their work are their outputs merged
+into the final MIDI stream.
+
+Maintaining this separation of responsibility is fundamental to the long-term
+extensibility and stability of the Tonic engine.

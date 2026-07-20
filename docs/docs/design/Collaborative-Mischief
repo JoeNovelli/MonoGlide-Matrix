@@ -1,0 +1,84 @@
+# Collaborative Mischief
+
+## Overview
+
+Collaborative Mischief explores the future evolution of Puppeteer into a playful musical collaborator.
+
+Unlike traditional generative MIDI tools, Mischief is not designed to generate independent musical ideas.
+
+Instead, it reacts to the player's musical energy, expanding the range of plausible musical interpretations while remaining rooted in the player's performance.
+
+---
+
+# Core Philosophy
+
+Puppeteer always collaborates.
+
+Mischief simply loosens the reins.
+
+Rather than introducing randomness for its own sake, Puppeteer gradually becomes more willing to reinterpret the player's intentions while remaining musically connected to the source performance.
+
+The player remains the composer.
+
+Puppeteer becomes a more adventurous collaborator.
+
+---
+
+# Performance Energy
+
+Rather than responding only to note data, Puppeteer observes performance behavior.
+
+Possible examples include:
+
+- note density
+- interval size
+- repeated patterns
+- rhythmic consistency
+- register movement
+- playing intensity
+- sustained vs fragmented phrases
+
+These characteristics form a musical energy profile that informs Puppeteer's interpretation.
+
+As performance energy increases, Puppeteer may become increasingly willing to make creative musical decisions.
+
+---
+
+# Mischief Control
+
+Future choreography modes may replace Tonic Response with a Mischief control.
+
+Rather than enabling randomness, Mischief expands Puppeteer's creative freedom.
+
+Possible internal variables include:
+
+- role confidence
+- transition timing
+- Bloom interpretation
+- voice persistence
+- voice count flexibility
+- release timing variation
+- octave exploration
+- other expressive interpretation parameters
+
+These remain hidden beneath one intuitive performance control.
+
+---
+
+# Guiding Principle
+
+The player should never feel disconnected from the result.
+
+Every unexpected musical event should still feel rooted in what the player performed.
+
+The goal is collaborative surprise rather than random generation.
+
+---
+
+# Happy Accidents
+
+Interesting bugs discovered during development should be documented before being fixed.
+
+Unexpected behaviors that prove musically inspiring may become future Mischief features.
+
+Rather than discarding these discoveries, MonoGlide Matrix should preserve them as possible future creative behaviors.
